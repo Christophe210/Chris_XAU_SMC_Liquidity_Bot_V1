@@ -1,0 +1,689 @@
+#property strict
+
+#include <Trade/Trade.mqh>
+CTrade trade;
+
+// =====================================================
+// Chris XAU SMC Liquidity Bot V1
+// Strategy:
+// - XAUUSD only
+// - Trading window: 09:00 - 18:00 Kigali
+// - M5 equal highs/lows liquidity detection (2 candles)
+// - Minimum sweep: 20 points
+// - M1 engulfing confirmation
+// - Risk: % of balance
+// - RR: 1:3
+// - Partial close 50% at 1R
+// - Move SL to BE after partial
+// - Fixed trailing after partial
+// - Max 2 trades/day
+// - Stop after first winner
+// =====================================================
+
+// =========================
+// Inputs
+// =========================
+input string InpSymbol                 = "XAUUSD";
+input double InpRiskPercent            = 10.0;
+input int    InpMaxTradesPerDay        = 2;
+input bool   InpStopAfterFirstWinner   = true;
+input int    InpMagicNumber            = 26031010;
+
+// Kigali trading time
+input int    InpTradeStartHour         = 9;
+input int    InpTradeStartMinute       = 0;
+input int    InpTradeEndHour           = 18;
+input int    InpTradeEndMinute         = 0;
+
+// Strategy settings
+input double InpSweepPoints            = 20.0;
+input double InpEqualTolerancePoints   = 10.0;
+input double InpRR                     = 3.0;
+input double InpPartialClosePercent    = 50.0;
+input bool   InpUseTrailing            = true;
+input double InpTrailPoints            = 150.0;
+input double InpSLBufferPoints         = 30.0;
+input double InpMaxSpreadPoints        = 1200.0;
+input bool   InpCloseAtSessionEnd      = true;
+input bool   InpPauseBotNow            = false;
+
+// =========================
+// Enums / Structs
+// =========================
+enum SetupSignal
+{
+   SIGNAL_NONE = 0,
+   SIGNAL_BUY  = 1,
+   SIGNAL_SELL = -1
+};
+
+enum SweepType
+{
+   SWEEP_NONE = 0,
+   SWEEP_LOW  = 1,
+   SWEEP_HIGH = -1
+};
+
+struct TradeMeta
+{
+   ulong    positionTicket;
+   datetime openTime;
+   double   entryPrice;
+   double   initialSL;
+   double   initialTP;
+   double   oneRDistance;
+   bool     partialTaken;
+   bool     breakevenMoved;
+};
+
+struct DailyState
+{
+   int      currentDayOfYear;
+   int      tradesToday;
+   bool     firstTradeWon;
+   bool     firstTradeLost;
+   bool     todayPaused;
+};
+
+struct SetupContext
+{
+   double equalHighLevel;
+   double equalLowLevel;
+   double sweepHigh;
+   double sweepLow;
+   SweepType sweepType;
+   datetime lastM5BarTime;
+};
+
+// =========================
+// Global state
+// =========================
+DailyState g_day;
+SetupContext g_setup;
+TradeMeta g_trade;
+bool g_hasTrackedTrade = false;
+
+// =========================
+// Helper prototypes
+// =========================
+int        GetDayOfYear(datetime t);
+void       ResetDailyStateIfNeeded();
+bool       IsTradingTime();
+bool       CheckDailyTradeRules();
+bool       IsSpreadOk();
+bool       HasOpenBotPosition();
+void       RefreshSetupContext();
+bool       DetectEqualHighs(double &level);
+bool       DetectEqualLows(double &level);
+SweepType  DetectSweep();
+bool       IsBearishEngulfing();
+bool       IsBullishEngulfing();
+SetupSignal FindTradeSetup();
+double     GetStopLossPrice(SetupSignal signal);
+double     GetTakeProfitPrice(SetupSignal signal, double entry, double sl);
+double     CalculateLotSize(double entry, double sl);
+bool       OpenBuyTrade();
+bool       OpenSellTrade();
+void       TrackOpenTrade();
+void       ManageOpenTrades();
+void       HandlePartialCloseAndTrailing();
+void       UpdateTradeOutcome();
+void       CloseAllBotPositions();
+string     SignalToString(SetupSignal s);
+
+// =========================
+// Init / Deinit
+// =========================
+int OnInit()
+{
+   if(!SymbolSelect(InpSymbol, true))
+   {
+      Print("Failed to select symbol: ", InpSymbol);
+      return INIT_FAILED;
+   }
+
+   trade.SetExpertMagicNumber(InpMagicNumber);
+
+   g_day.currentDayOfYear = GetDayOfYear(TimeCurrent());
+   g_day.tradesToday      = 0;
+   g_day.firstTradeWon    = false;
+   g_day.firstTradeLost   = false;
+   g_day.todayPaused      = false;
+
+   g_setup.equalHighLevel = 0.0;
+   g_setup.equalLowLevel  = 0.0;
+   g_setup.sweepHigh      = 0.0;
+   g_setup.sweepLow       = 0.0;
+   g_setup.sweepType      = SWEEP_NONE;
+   g_setup.lastM5BarTime  = 0;
+
+   Print("Chris XAU SMC Liquidity Bot V1 initialized.");
+   return INIT_SUCCEEDED;
+}
+
+void OnDeinit(const int reason)
+{
+   Print("Chris XAU SMC Liquidity Bot V1 stopped. reason=", reason);
+}
+
+// =========================
+// Main loop
+// =========================
+void OnTick()
+{
+   ResetDailyStateIfNeeded();
+   UpdateTradeOutcome();
+   ManageOpenTrades();
+
+   if(InpPauseBotNow)
+      return;
+
+   if(!IsTradingTime())
+   {
+      if(InpCloseAtSessionEnd)
+         CloseAllBotPositions();
+      return;
+   }
+
+   if(!CheckDailyTradeRules())
+      return;
+
+   if(!IsSpreadOk())
+      return;
+
+   if(HasOpenBotPosition())
+      return;
+
+   RefreshSetupContext();
+
+   SetupSignal signal = FindTradeSetup();
+   if(signal == SIGNAL_BUY)
+      OpenBuyTrade();
+   else if(signal == SIGNAL_SELL)
+      OpenSellTrade();
+}
+
+// =========================
+// Date / session logic
+// =========================
+int GetDayOfYear(datetime t)
+{
+   MqlDateTime dt;
+   TimeToStruct(t, dt);
+   return dt.day_of_year;
+}
+
+void ResetDailyStateIfNeeded()
+{
+   int today = GetDayOfYear(TimeCurrent());
+   if(today != g_day.currentDayOfYear)
+   {
+      g_day.currentDayOfYear = today;
+      g_day.tradesToday      = 0;
+      g_day.firstTradeWon    = false;
+      g_day.firstTradeLost   = false;
+      g_day.todayPaused      = false;
+      Print("Daily state reset.");
+   }
+}
+
+bool IsTradingTime()
+{
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   int nowMin   = dt.hour * 60 + dt.min;
+   int startMin = InpTradeStartHour * 60 + InpTradeStartMinute;
+   int endMin   = InpTradeEndHour * 60 + InpTradeEndMinute;
+   return (nowMin >= startMin && nowMin < endMin);
+}
+
+bool CheckDailyTradeRules()
+{
+   if(g_day.todayPaused)
+      return false;
+   if(g_day.tradesToday >= InpMaxTradesPerDay)
+      return false;
+   if(InpStopAfterFirstWinner && g_day.firstTradeWon)
+      return false;
+   return true;
+}
+
+bool IsSpreadOk()
+{
+   double ask = SymbolInfoDouble(InpSymbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(InpSymbol, SYMBOL_BID);
+   double spreadPts = (ask - bid) / _Point;
+   return (spreadPts <= InpMaxSpreadPoints);
+}
+
+// =========================
+// Position helpers
+// =========================
+bool HasOpenBotPosition()
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(!PositionSelectByTicket(ticket)) continue;
+
+      if(PositionGetString(POSITION_SYMBOL) == InpSymbol &&
+         PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
+      {
+         return true;
+      }
+   }
+   return false;
+}
+
+void CloseAllBotPositions()
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(!PositionSelectByTicket(ticket)) continue;
+
+      if(PositionGetString(POSITION_SYMBOL) == InpSymbol &&
+         PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
+      {
+         trade.PositionClose(ticket);
+      }
+   }
+}
+
+// =========================
+// Setup detection
+// =========================
+void RefreshSetupContext()
+{
+   datetime barTime = iTime(InpSymbol, PERIOD_M5, 0);
+   if(barTime == 0 || barTime == g_setup.lastM5BarTime)
+      return;
+
+   g_setup.lastM5BarTime = barTime;
+   g_setup.equalHighLevel = 0.0;
+   g_setup.equalLowLevel  = 0.0;
+   g_setup.sweepHigh      = 0.0;
+   g_setup.sweepLow       = 0.0;
+   g_setup.sweepType      = SWEEP_NONE;
+
+   double level = 0.0;
+   if(DetectEqualHighs(level))
+      g_setup.equalHighLevel = level;
+   if(DetectEqualLows(level))
+      g_setup.equalLowLevel = level;
+
+   g_setup.sweepType = DetectSweep();
+}
+
+bool DetectEqualHighs(double &level)
+{
+   MqlRates rates[4];
+   ArraySetAsSeries(rates, true);
+   if(CopyRates(InpSymbol, PERIOD_M5, 1, 3, rates) < 3)
+      return false;
+
+   double high1 = rates[0].high;
+   double high2 = rates[1].high;
+   double diffPts = MathAbs(high1 - high2) / _Point;
+
+   if(diffPts <= InpEqualTolerancePoints)
+   {
+      level = MathMax(high1, high2);
+      return true;
+   }
+   return false;
+}
+
+bool DetectEqualLows(double &level)
+{
+   MqlRates rates[4];
+   ArraySetAsSeries(rates, true);
+   if(CopyRates(InpSymbol, PERIOD_M5, 1, 3, rates) < 3)
+      return false;
+
+   double low1 = rates[0].low;
+   double low2 = rates[1].low;
+   double diffPts = MathAbs(low1 - low2) / _Point;
+
+   if(diffPts <= InpEqualTolerancePoints)
+   {
+      level = MathMin(low1, low2);
+      return true;
+   }
+   return false;
+}
+
+SweepType DetectSweep()
+{
+   MqlRates m5[3];
+   ArraySetAsSeries(m5, true);
+   if(CopyRates(InpSymbol, PERIOD_M5, 0, 2, m5) < 2)
+      return SWEEP_NONE;
+
+   if(g_setup.equalHighLevel > 0.0)
+   {
+      double sweptByPts = (m5[0].high - g_setup.equalHighLevel) / _Point;
+      if(sweptByPts >= InpSweepPoints)
+      {
+         g_setup.sweepHigh = m5[0].high;
+         return SWEEP_HIGH;
+      }
+   }
+
+   if(g_setup.equalLowLevel > 0.0)
+   {
+      double sweptByPts = (g_setup.equalLowLevel - m5[0].low) / _Point;
+      if(sweptByPts >= InpSweepPoints)
+      {
+         g_setup.sweepLow = m5[0].low;
+         return SWEEP_LOW;
+      }
+   }
+
+   return SWEEP_NONE;
+}
+
+bool IsBearishEngulfing()
+{
+   MqlRates m1[4];
+   ArraySetAsSeries(m1, true);
+   if(CopyRates(InpSymbol, PERIOD_M1, 1, 3, m1) < 3)
+      return false;
+
+   bool prevBull = (m1[1].close > m1[1].open);
+   bool currBear = (m1[0].close < m1[0].open);
+   bool engulf   = (m1[0].open > m1[1].close && m1[0].close < m1[1].open);
+
+   return (prevBull && currBear && engulf);
+}
+
+bool IsBullishEngulfing()
+{
+   MqlRates m1[4];
+   ArraySetAsSeries(m1, true);
+   if(CopyRates(InpSymbol, PERIOD_M1, 1, 3, m1) < 3)
+      return false;
+
+   bool prevBear = (m1[1].close < m1[1].open);
+   bool currBull = (m1[0].close > m1[0].open);
+   bool engulf   = (m1[0].open < m1[1].close && m1[0].close > m1[1].open);
+
+   return (prevBear && currBull && engulf);
+}
+
+SetupSignal FindTradeSetup()
+{
+   if(g_setup.sweepType == SWEEP_HIGH && IsBearishEngulfing())
+      return SIGNAL_SELL;
+
+   if(g_setup.sweepType == SWEEP_LOW && IsBullishEngulfing())
+      return SIGNAL_BUY;
+
+   return SIGNAL_NONE;
+}
+
+// =========================
+// Trade pricing / sizing
+// =========================
+double GetStopLossPrice(SetupSignal signal)
+{
+   if(signal == SIGNAL_SELL && g_setup.sweepHigh > 0.0)
+      return NormalizeDouble(g_setup.sweepHigh + InpSLBufferPoints * _Point, _Digits);
+
+   if(signal == SIGNAL_BUY && g_setup.sweepLow > 0.0)
+      return NormalizeDouble(g_setup.sweepLow - InpSLBufferPoints * _Point, _Digits);
+
+   return 0.0;
+}
+
+double GetTakeProfitPrice(SetupSignal signal, double entry, double sl)
+{
+   double riskDistance = MathAbs(entry - sl);
+   if(riskDistance <= 0.0)
+      return 0.0;
+
+   if(signal == SIGNAL_BUY)
+      return NormalizeDouble(entry + (riskDistance * InpRR), _Digits);
+
+   if(signal == SIGNAL_SELL)
+      return NormalizeDouble(entry - (riskDistance * InpRR), _Digits);
+
+   return 0.0;
+}
+
+double CalculateLotSize(double entry, double sl)
+{
+   double balance      = AccountInfoDouble(ACCOUNT_BALANCE);
+   double riskMoney    = balance * (InpRiskPercent / 100.0);
+   double tickSize     = SymbolInfoDouble(InpSymbol, SYMBOL_TRADE_TICK_SIZE);
+   double tickValue    = SymbolInfoDouble(InpSymbol, SYMBOL_TRADE_TICK_VALUE);
+   double volumeMin    = SymbolInfoDouble(InpSymbol, SYMBOL_VOLUME_MIN);
+   double volumeMax    = SymbolInfoDouble(InpSymbol, SYMBOL_VOLUME_MAX);
+   double volumeStep   = SymbolInfoDouble(InpSymbol, SYMBOL_VOLUME_STEP);
+   double stopDistance = MathAbs(entry - sl);
+
+   if(tickSize <= 0 || tickValue <= 0 || stopDistance <= 0)
+      return 0.0;
+
+   double moneyPerLot = (stopDistance / tickSize) * tickValue;
+   if(moneyPerLot <= 0)
+      return 0.0;
+
+   double rawLots = riskMoney / moneyPerLot;
+   double lots = MathFloor(rawLots / volumeStep) * volumeStep;
+   lots = MathMax(volumeMin, MathMin(volumeMax, lots));
+   return NormalizeDouble(lots, 2);
+}
+
+// =========================
+// Trade execution
+// =========================
+bool OpenBuyTrade()
+{
+   double entry = SymbolInfoDouble(InpSymbol, SYMBOL_ASK);
+   double sl    = GetStopLossPrice(SIGNAL_BUY);
+   double tp    = GetTakeProfitPrice(SIGNAL_BUY, entry, sl);
+   double lots  = CalculateLotSize(entry, sl);
+
+   if(sl <= 0.0 || tp <= 0.0 || lots <= 0.0)
+      return false;
+
+   trade.SetExpertMagicNumber(InpMagicNumber);
+   bool ok = trade.Buy(lots, InpSymbol, 0.0, sl, tp, "Chris SMC Liquidity BUY");
+   if(ok)
+   {
+      g_day.tradesToday++;
+      TrackOpenTrade();
+      Print("BUY opened. lots=", lots, " sl=", sl, " tp=", tp);
+   }
+   else
+   {
+      Print("BUY failed. Retcode=", trade.ResultRetcode(), " msg=", trade.ResultRetcodeDescription());
+   }
+   return ok;
+}
+
+bool OpenSellTrade()
+{
+   double entry = SymbolInfoDouble(InpSymbol, SYMBOL_BID);
+   double sl    = GetStopLossPrice(SIGNAL_SELL);
+   double tp    = GetTakeProfitPrice(SIGNAL_SELL, entry, sl);
+   double lots  = CalculateLotSize(entry, sl);
+
+   if(sl <= 0.0 || tp <= 0.0 || lots <= 0.0)
+      return false;
+
+   trade.SetExpertMagicNumber(InpMagicNumber);
+   bool ok = trade.Sell(lots, InpSymbol, 0.0, sl, tp, "Chris SMC Liquidity SELL");
+   if(ok)
+   {
+      g_day.tradesToday++;
+      TrackOpenTrade();
+      Print("SELL opened. lots=", lots, " sl=", sl, " tp=", tp);
+   }
+   else
+   {
+      Print("SELL failed. Retcode=", trade.ResultRetcode(), " msg=", trade.ResultRetcodeDescription());
+   }
+   return ok;
+}
+
+void TrackOpenTrade()
+{
+   g_hasTrackedTrade = false;
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(!PositionSelectByTicket(ticket)) continue;
+
+      if(PositionGetString(POSITION_SYMBOL) == InpSymbol &&
+         PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
+      {
+         g_trade.positionTicket = ticket;
+         g_trade.openTime       = (datetime)PositionGetInteger(POSITION_TIME);
+         g_trade.entryPrice     = PositionGetDouble(POSITION_PRICE_OPEN);
+         g_trade.initialSL      = PositionGetDouble(POSITION_SL);
+         g_trade.initialTP      = PositionGetDouble(POSITION_TP);
+         g_trade.oneRDistance   = MathAbs(g_trade.entryPrice - g_trade.initialSL);
+         g_trade.partialTaken   = false;
+         g_trade.breakevenMoved = false;
+         g_hasTrackedTrade      = true;
+         return;
+      }
+   }
+}
+
+// =========================
+// Trade management
+// =========================
+void ManageOpenTrades()
+{
+   if(!g_hasTrackedTrade)
+      return;
+
+   if(!PositionSelectByTicket(g_trade.positionTicket))
+   {
+      g_hasTrackedTrade = false;
+      return;
+   }
+
+   HandlePartialCloseAndTrailing();
+}
+
+void HandlePartialCloseAndTrailing()
+{
+   if(!PositionSelectByTicket(g_trade.positionTicket))
+      return;
+
+   long type        = PositionGetInteger(POSITION_TYPE);
+   double volume    = PositionGetDouble(POSITION_VOLUME);
+   double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+   double sl        = PositionGetDouble(POSITION_SL);
+   double tp        = PositionGetDouble(POSITION_TP);
+   double current   = (type == POSITION_TYPE_BUY)
+                      ? SymbolInfoDouble(InpSymbol, SYMBOL_BID)
+                      : SymbolInfoDouble(InpSymbol, SYMBOL_ASK);
+
+   double moveDistance = (type == POSITION_TYPE_BUY)
+                         ? (current - openPrice)
+                         : (openPrice - current);
+
+   // 1R partial close
+   if(!g_trade.partialTaken && moveDistance >= g_trade.oneRDistance)
+   {
+      double closeVol = volume * (InpPartialClosePercent / 100.0);
+      double volStep  = SymbolInfoDouble(InpSymbol, SYMBOL_VOLUME_STEP);
+      double volMin   = SymbolInfoDouble(InpSymbol, SYMBOL_VOLUME_MIN);
+      closeVol = MathFloor(closeVol / volStep) * volStep;
+
+      if(closeVol >= volMin && closeVol < volume)
+      {
+         if(trade.PositionClosePartial(g_trade.positionTicket, closeVol))
+         {
+            g_trade.partialTaken = true;
+
+            // move SL to BE
+            if(trade.PositionModify(g_trade.positionTicket, NormalizeDouble(openPrice, _Digits), tp))
+               g_trade.breakevenMoved = true;
+
+            Print("Partial close done at 1R. Ticket=", g_trade.positionTicket);
+         }
+      }
+   }
+
+   // Fixed trailing after partial
+   if(InpUseTrailing && g_trade.partialTaken)
+   {
+      double newSL = sl;
+
+      if(type == POSITION_TYPE_BUY)
+      {
+         newSL = NormalizeDouble(current - (InpTrailPoints * _Point), _Digits);
+         if(newSL > sl && newSL < current)
+            trade.PositionModify(g_trade.positionTicket, newSL, tp);
+      }
+      else if(type == POSITION_TYPE_SELL)
+      {
+         newSL = NormalizeDouble(current + (InpTrailPoints * _Point), _Digits);
+         if((sl == 0.0 || newSL < sl) && newSL > current)
+            trade.PositionModify(g_trade.positionTicket, newSL, tp);
+      }
+   }
+}
+
+void UpdateTradeOutcome()
+{
+   static ulong lastProcessedDeal = 0;
+
+   datetime dayStart = StringToTime(TimeToString(TimeCurrent(), TIME_DATE) + " 00:00");
+   if(!HistorySelect(dayStart, TimeCurrent()))
+      return;
+
+   for(int i = HistoryDealsTotal() - 1; i >= 0; i--)
+   {
+      ulong deal = HistoryDealGetTicket(i);
+      if(deal == 0 || deal == lastProcessedDeal)
+         break;
+
+      if(HistoryDealGetString(deal, DEAL_SYMBOL) != InpSymbol)
+         continue;
+      if((long)HistoryDealGetInteger(deal, DEAL_MAGIC) != InpMagicNumber)
+         continue;
+      if((long)HistoryDealGetInteger(deal, DEAL_ENTRY) != DEAL_ENTRY_OUT)
+         continue;
+
+      double pnl = HistoryDealGetDouble(deal, DEAL_PROFIT)
+                 + HistoryDealGetDouble(deal, DEAL_SWAP)
+                 + HistoryDealGetDouble(deal, DEAL_COMMISSION);
+
+      if(pnl > 0.0)
+      {
+         if(g_day.tradesToday == 1)
+         {
+            g_day.firstTradeWon = true;
+            if(InpStopAfterFirstWinner)
+               g_day.todayPaused = true;
+         }
+      }
+      else if(pnl < 0.0)
+      {
+         if(g_day.tradesToday == 1)
+            g_day.firstTradeLost = true;
+      }
+
+      lastProcessedDeal = deal;
+      g_hasTrackedTrade = false;
+      break;
+   }
+}
+
+string SignalToString(SetupSignal s)
+{
+   if(s == SIGNAL_BUY) return "BUY";
+   if(s == SIGNAL_SELL) return "SELL";
+   return "NONE";
+}
