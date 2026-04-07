@@ -6,6 +6,7 @@
 
 
 
+
 What this first MT5 EA skeleton already includes:
 
 XAUUSD only
