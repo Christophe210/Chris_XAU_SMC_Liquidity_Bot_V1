@@ -3,7 +3,6 @@
 
 
 
-
 #property strict
 
 #include <Trade/Trade.mqh>
